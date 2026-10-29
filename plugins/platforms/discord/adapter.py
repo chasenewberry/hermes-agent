@@ -438,8 +438,8 @@ def _format_privileged_intents_guidance(*, needs_members: bool) -> str:
 
 
 def _load_opus_codec() -> None:
-    """Try bundled (Windows) opus, then ``ctypes.util.find_library``, then Homebrew paths
-    (find_library misses Homebrew libs on macOS); warn once if none loads."""
+    """Try bundled (Windows) opus, then ``ctypes.util.find_library``, standard Linux paths,
+    or Homebrew paths (find_library misses Homebrew libs on macOS); warn once if none loads."""
     import ctypes.util
     opus_candidates = []
     bundled_opus = _find_discord_windows_bundled_opus(discord)
@@ -453,6 +453,18 @@ def _load_opus_codec() -> None:
             if os.path.isfile(_hp):
                 opus_candidates.append(_hp)
                 break
+    if sys.platform != "win32":
+        for _lp in (
+            "/usr/lib/aarch64-linux-gnu/libopus.so.0",
+            "/usr/lib/x86_64-linux-gnu/libopus.so.0",
+            "/usr/lib/arm-linux-gnueabihf/libopus.so.0",
+            "/usr/lib/libopus.so.0",
+            "/usr/lib64/libopus.so.0",
+            "/usr/local/lib/libopus.so",
+            "/usr/local/lib/libopus.so.0",
+        ):
+            if os.path.isfile(_lp) and _lp not in opus_candidates:
+                opus_candidates.append(_lp)
     for opus_path in opus_candidates:
         try:
             discord.opus.load_opus(opus_path)
@@ -461,7 +473,13 @@ def _load_opus_codec() -> None:
         except Exception:
             logger.warning("Opus codec found at %s but failed to load", opus_path)
     if not discord.opus.is_loaded():
-        logger.warning("Opus codec not found — voice channel playback disabled")
+        try:
+            if hasattr(discord.opus, "_load_default"):
+                discord.opus._load_default()
+        except Exception:
+            pass
+    if not discord.opus.is_loaded():
+        logger.warning("Opus codec not found — voice channel receiving and playback disabled")
 
 
 def _find_discord_windows_bundled_opus(discord_module: Any = None) -> Optional[str]:
@@ -745,6 +763,7 @@ class VoiceReceiver:
         self._decode_ok = 0
         self._decode_failed = 0
         self._dave_unmapped_dropped = 0
+        self._opus_decode_failed = 0
         self._nacl_fail_streak = 0
 
     # ------------------------------------------------------------------
@@ -753,13 +772,23 @@ class VoiceReceiver:
 
     def start(self):
         """Start listening for voice packets."""
+        if not discord.opus.is_loaded():
+            _load_opus_codec()
+        if not discord.opus.is_loaded():
+            logger.warning(
+                "VoiceReceiver started but Opus codec is not loaded — voice decoding and playback will fail"
+            )
         conn = self._vc._connection
         self._resolve_credentials(conn)
 
         self._install_speaking_hook(conn)
         conn.add_socket_listener(self._on_packet)
         self._running = True
-        logger.info("VoiceReceiver started (bot_ssrc=%d)", self._bot_ssrc)
+        logger.info(
+            "VoiceReceiver started (bot_ssrc=%d, opus_loaded=%s)",
+            self._bot_ssrc,
+            discord.opus.is_loaded(),
+        )
 
     def _resolve_credentials(self, conn) -> None:
         """Read the current decryption state from the live connection.
@@ -859,10 +888,11 @@ class VoiceReceiver:
             self._ssrc_to_user.clear()
         logger.info(
             "VoiceReceiver stopped (frames ok=%d, decrypt_failed=%d, "
-            "dave_unmapped_dropped=%d)",
+            "dave_unmapped_dropped=%d, opus_failed=%d)",
             self._decode_ok,
             self._decode_failed,
             self._dave_unmapped_dropped,
+            self._opus_decode_failed,
         )
 
     def pause(self):
@@ -1099,7 +1129,15 @@ class VoiceReceiver:
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
-            logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
+            self._opus_decode_failed += 1
+            if self._opus_decode_failed <= 10 or self._opus_decode_failed % 250 == 0:
+                logger.warning(
+                    "Opus decode error for SSRC %s (is_loaded=%s, fail_count=%d); reset decoder: %s",
+                    ssrc,
+                    discord.opus.is_loaded(),
+                    self._opus_decode_failed,
+                    e,
+                )
             return
 
     # --- Silence detection ---

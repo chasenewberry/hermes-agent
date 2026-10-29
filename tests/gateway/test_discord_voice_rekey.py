@@ -24,7 +24,7 @@ import pytest
 
 pytest.importorskip("discord")
 
-from plugins.platforms.discord.adapter import VoiceReceiver
+from plugins.platforms.discord.adapter import VoiceReceiver, _load_opus_codec
 
 
 KEY_A = bytes(range(32))
@@ -441,9 +441,47 @@ class TestTeardownHealthLine:
         receiver._decode_ok = 10
         receiver._decode_failed = 3
         receiver._dave_unmapped_dropped = 2
+        receiver._opus_decode_failed = 1
         with caplog.at_level(logging.INFO):
             receiver.stop()
         line = "\n".join(r.getMessage() for r in caplog.records)
         assert "ok=10" in line
         assert "decrypt_failed=3" in line
         assert "dave_unmapped_dropped=2" in line
+        assert "opus_failed=1" in line
+
+
+class TestOpusResolution:
+    def test_load_opus_codec_linux_paths(self):
+        with patch("discord.opus.is_loaded", side_effect=[False, False, True]):
+            with patch("discord.opus.load_opus") as mock_load:
+                with patch("os.path.isfile", side_effect=lambda p: p == "/usr/lib/aarch64-linux-gnu/libopus.so.0"):
+                    with patch("ctypes.util.find_library", return_value=None):
+                        _load_opus_codec()
+                        mock_load.assert_called_with("/usr/lib/aarch64-linux-gnu/libopus.so.0")
+
+    def test_start_warns_when_opus_not_loaded(self, caplog):
+        import logging
+
+        conn = _make_conn()
+        vc = _make_vc(conn)
+        receiver = VoiceReceiver(vc)
+        with patch("discord.opus.is_loaded", return_value=False):
+            with patch("plugins.platforms.discord.adapter._load_opus_codec"):
+                with caplog.at_level(logging.WARNING):
+                    receiver.start()
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Opus codec is not loaded" in m for m in messages)
+
+    def test_on_packet_tracks_opus_decode_failure(self, fake_nacl, caplog):
+        import logging
+
+        conn = _make_conn()
+        receiver = _make_receiver(conn)
+        receiver.map_ssrc(1234, 42)
+        with patch("discord.opus.Decoder", side_effect=Exception("OpusNotLoaded")):
+            with caplog.at_level(logging.WARNING):
+                receiver._on_packet(_rtp_packet(ssrc=1234))
+        assert receiver._opus_decode_failed == 1
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Opus decode error" in m for m in messages)
