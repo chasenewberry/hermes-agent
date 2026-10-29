@@ -14,6 +14,7 @@ import threading
 import asyncio
 import json
 import os
+from pathlib import Path
 import urllib.parse
 import urllib.request
 from fastapi import APIRouter
@@ -408,11 +409,55 @@ class _SyncSentencePCMStreamer:
             yield pcm
 
 
+def _resolve_sync_pcm_tmp_dir() -> Path:
+    """Return an allowed, safe audio cache directory for sync sentence intermediate files.
+
+    Must NOT use tempfile's default directory ($TMPDIR/scratch), which Hermes' file-safety
+    policy intentionally denies as a TTS output location. Prefers configured safe roots,
+    HERMES_REAL_HOME, or the standard profile-aware audio cache directory.
+    """
+    from tools.tts_tool import _default_output_dir
+    from agent.file_safety import is_write_denied, get_safe_write_roots
+
+    candidates: list[Path] = []
+    # 1. Configured safe write roots (containers and restricted environments)
+    for root in sorted(get_safe_write_roots()):
+        candidates.append(Path(root) / "cache" / "audio")
+
+    # 2. Explicit operator/account real home
+    real_home = os.environ.get("HERMES_REAL_HOME")
+    if real_home:
+        candidates.append(Path(real_home) / "cache" / "audio")
+
+    # 3. Hermes default audio cache (honors profile scoping)
+    with contextlib.suppress(Exception):
+        candidates.append(Path(_default_output_dir()))
+
+    # 4. Current working directory fallback
+    candidates.append(Path.cwd() / "cache" / "audio")
+
+    for candidate in candidates:
+        cand_path = candidate.resolve()
+        probe_file = str(cand_path / "probe.mp3")
+        if not is_write_denied(probe_file):
+            cand_path.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                cand_path.chmod(0o700)
+            return cand_path
+
+    fallback = Path(_default_output_dir()).resolve()
+    fallback.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        fallback.chmod(0o700)
+    return fallback
+
+
 def _sync_sentence_to_pcm(text: str) -> tuple:
     """Synthesize *text* with the configured sync provider and return PCM."""
     from tools.tts_tool import text_to_speech_tool
 
-    fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+    audio_tmp_dir = _resolve_sync_pcm_tmp_dir()
+    fd, tmp_path = tempfile.mkstemp(suffix=".mp3", dir=audio_tmp_dir)
     os.close(fd)
     extra = None
     try:

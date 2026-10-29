@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from urllib.parse import urlencode
 
@@ -221,5 +222,88 @@ def test_edge_speak_stream_speaks_each_sentence_instead_of_whole_text_fallback(
     assert first in calls[0] and second not in calls[0]
     assert second in calls[1] and first not in calls[1]
     assert reply not in calls
+
+
+def test_sync_sentence_to_pcm_uses_safe_audio_cache_not_denied_tmpdir(monkeypatch, tmp_path):
+    """_sync_sentence_to_pcm must never use $TMPDIR when TMPDIR is a denied scratch directory."""
+    from hermes_cli.web_routers import audio
+
+    denied_scratch = tmp_path / "scratch"
+    denied_scratch.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TMPDIR", str(denied_scratch))
+    monkeypatch.setenv("TEMP", str(denied_scratch))
+    monkeypatch.setenv("TMP", str(denied_scratch))
+
+    safe_audio_cache = tmp_path / "cache" / "audio"
+    safe_audio_cache.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("tools.tts_tool._default_output_dir", lambda: str(safe_audio_cache))
+
+    def fake_is_write_denied(path: str) -> bool:
+        return str(denied_scratch) in str(path)
+
+    monkeypatch.setattr("agent.file_safety.is_write_denied", fake_is_write_denied)
+    monkeypatch.setattr("agent.file_safety.get_safe_write_roots", lambda: {str(tmp_path)})
+
+    captured_output_path = []
+
+    def fake_tts(*args, **kwargs):
+        path = kwargs.get("output_path")
+        captured_output_path.append(path)
+        with open(path, "wb") as fh:
+            fh.write(b"fake_mp3_data")
+        return json.dumps({"success": True, "file_path": path})
+
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", fake_tts)
+    monkeypatch.setattr("hermes_cli.web_routers.audio._audio_file_to_pcm", lambda path: (b"\x01\x02", 24000))
+
+    pcm, rate = audio._sync_sentence_to_pcm("Hello world.")
+    assert pcm == b"\x01\x02"
+    assert rate == 24000
+    assert len(captured_output_path) == 1
+    used_path = captured_output_path[0]
+    assert not used_path.startswith(str(denied_scratch))
+    assert used_path.endswith(".mp3")
+    assert not os.path.exists(used_path)
+
+
+def test_sync_sentence_to_pcm_cleans_up_on_failure(monkeypatch, tmp_path):
+    """_sync_sentence_to_pcm must clean up intermediate files even on synthesis failure."""
+    from hermes_cli.web_routers import audio
+
+    safe_audio_cache = tmp_path / "cache" / "audio"
+    safe_audio_cache.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("tools.tts_tool._default_output_dir", lambda: str(safe_audio_cache))
+    monkeypatch.setattr("agent.file_safety.get_safe_write_roots", lambda: {str(tmp_path)})
+
+    created_paths = []
+
+    def failing_tts(*args, **kwargs):
+        path = kwargs.get("output_path")
+        created_paths.append(path)
+        with open(path, "wb") as fh:
+            fh.write(b"partial")
+        return json.dumps({"success": False, "error": "Synthesis failed"})
+
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", failing_tts)
+
+    with pytest.raises(RuntimeError, match="Synthesis failed"):
+        audio._sync_sentence_to_pcm("This will fail.")
+
+    assert len(created_paths) == 1
+    assert not os.path.exists(created_paths[0])
+
+
+def test_resolve_sync_pcm_tmp_dir_prefers_safe_roots_and_real_home(monkeypatch, tmp_path):
+    """_resolve_sync_pcm_tmp_dir probes candidate directories and returns a writable, allowed directory."""
+    from hermes_cli.web_routers import audio
+
+    safe_root = tmp_path / "opt_data"
+    monkeypatch.setattr("agent.file_safety.get_safe_write_roots", lambda: {str(safe_root)})
+    monkeypatch.setattr("agent.file_safety.is_write_denied", lambda p: not str(p).startswith(str(safe_root)))
+
+    chosen = audio._resolve_sync_pcm_tmp_dir()
+    assert str(chosen).startswith(str(safe_root))
+    assert chosen.exists()
+
 
 
